@@ -134,6 +134,29 @@ class VisionRotaryEmbeddingFast(nn.Module):
     def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin
 
 
+class RotaryEmbedding1D(nn.Module):
+    """
+    Standard 1D Rotary Embedding for Temporal Dimension
+    """
+    def __init__(self, dim, max_seq_len=32, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, :, :])
+
+    def forward(self, x):
+        # x: [B, T, C] or [B, N, T, C] -> we assume T is the sequence dimension
+        seq_len = x.shape[-2] # Assuming (Batch, Seq, HeadDim) or similar
+        return (
+            x * self.cos_cached[:, :seq_len, ...].to(x.device)
+        ) + (
+            rotate_half(x) * self.sin_cached[:, :seq_len, ...].to(x.device)
+        )
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """

@@ -4,50 +4,59 @@ from model_jit import JiT_models
 
 
 class Denoiser(nn.Module):
-    def __init__(
-        self,
-        args
-    ):
+    def __init__(self, args):
         super().__init__()
         self.net = JiT_models[args.model](
             input_size=args.img_size,
-            in_channels=3,
-            num_classes=args.class_num,
+            in_channels=6,
+            # num_classes removed
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
+            num_frames=args.num_frames
         )
         self.img_size = args.img_size
-        self.num_classes = args.class_num
-
-        self.label_drop_prob = args.label_drop_prob
+        self.num_frames = args.num_frames
+        
+        # label_drop_prob REUSED as image_drop_prob for training
+        self.image_drop_prob = args.label_drop_prob 
+        
         self.P_mean = args.P_mean
         self.P_std = args.P_std
         self.t_eps = args.t_eps
         self.noise_scale = args.noise_scale
 
-        # ema
         self.ema_decay1 = args.ema_decay1
         self.ema_decay2 = args.ema_decay2
         self.ema_params1 = None
         self.ema_params2 = None
 
-        # generation hyper params
         self.method = args.sampling_method
         self.steps = args.num_sampling_steps
         self.cfg_scale = args.cfg
         self.cfg_interval = (args.interval_min, args.interval_max)
 
-    def drop_labels(self, labels):
-        drop = torch.rand(labels.shape[0], device=labels.device) < self.label_drop_prob
-        out = torch.where(drop, torch.full_like(labels, self.num_classes), labels)
-        return out
-
     def sample_t(self, n: int, device=None):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
-    def forward(self, x, labels):
-        labels_dropped = self.drop_labels(labels) if self.training else labels
+    def get_model_input(self, z, ref_img):
+        # z: (B, 3, T, H, W)
+        # ref_img: (B, 3, H, W)
+        if ref_img.ndim == 4:
+            ref_img = ref_img.unsqueeze(2)
+        ref_img_expanded = ref_img.expand(-1, -1, z.shape[2], -1, -1)
+        return torch.cat([z, ref_img_expanded], dim=1)
+
+    def forward(self, x, ref_img): # REMOVED labels
+        # Visual Condition Dropout for Training
+        if self.training and self.image_drop_prob > 0:
+            # Mask: 1 means keep, 0 means drop (replace with zeros)
+            mask_prob = 1 - self.image_drop_prob
+            # Create a mask of shape (B, 1, 1, 1)
+            mask = torch.bernoulli(torch.full((ref_img.shape[0], 1, 1, 1), mask_prob, device=ref_img.device))
+            ref_img_input = ref_img * mask
+        else:
+            ref_img_input = ref_img
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
@@ -55,21 +64,23 @@ class Denoiser(nn.Module):
         z = t * x + (1 - t) * e
         v = (x - z) / (1 - t).clamp_min(self.t_eps)
 
-        x_pred = self.net(z, t.flatten(), labels_dropped)
+        model_input = self.get_model_input(z, ref_img_input)
+
+        # Removed labels from net forward
+        x_pred = self.net(model_input, t.flatten()) 
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
-        # l2 loss
         loss = (v - v_pred) ** 2
-        loss = loss.mean(dim=(1, 2, 3)).mean()
+        loss = loss.mean(dim=(1, 2, 3, 4)).mean()
 
         return loss
 
     @torch.no_grad()
-    def generate(self, labels):
-        device = labels.device
-        bsz = labels.size(0)
-        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
-        timesteps = torch.linspace(0.0, 1.0, self.steps+1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
+    def generate(self, ref_img): # REMOVED labels
+        device = ref_img.device
+        bsz = ref_img.size(0)
+        z = self.noise_scale * torch.randn(bsz, 3, self.num_frames, self.img_size, self.img_size, device=device)
+        timesteps = torch.linspace(0.0, 1.0, self.steps+1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1, -1)
 
         if self.method == "euler":
             stepper = self._euler_step
@@ -78,26 +89,26 @@ class Denoiser(nn.Module):
         else:
             raise NotImplementedError
 
-        # ode
         for i in range(self.steps - 1):
             t = timesteps[i]
             t_next = timesteps[i + 1]
-            z = stepper(z, t, t_next, labels)
-        # last step euler
-        z = self._euler_step(z, timesteps[-2], timesteps[-1], labels)
+            z = stepper(z, t, t_next, ref_img)
+        z = self._euler_step(z, timesteps[-2], timesteps[-1], ref_img)
         return z
 
     @torch.no_grad()
-    def _forward_sample(self, z, t, labels):
-        # conditional
-        x_cond = self.net(z, t.flatten(), labels)
+    def _forward_sample(self, z, t, ref_img):
+        # Conditional pass (with reference image)
+        model_input_cond = self.get_model_input(z, ref_img)
+        x_cond = self.net(model_input_cond, t.flatten())
         v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
 
-        # unconditional
-        x_uncond = self.net(z, t.flatten(), torch.full_like(labels, self.num_classes))
+        # Unconditional pass (with BLACK image)
+        ref_img_null = torch.zeros_like(ref_img)
+        model_input_uncond = self.get_model_input(z, ref_img_null)
+        x_uncond = self.net(model_input_uncond, t.flatten())
         v_uncond = (x_uncond - z) / (1.0 - t).clamp_min(self.t_eps)
 
-        # cfg interval
         low, high = self.cfg_interval
         interval_mask = (t < high) & ((low == 0) | (t > low))
         cfg_scale_interval = torch.where(interval_mask, self.cfg_scale, 1.0)
@@ -105,22 +116,21 @@ class Denoiser(nn.Module):
         return v_uncond + cfg_scale_interval * (v_cond - v_uncond)
 
     @torch.no_grad()
-    def _euler_step(self, z, t, t_next, labels):
-        v_pred = self._forward_sample(z, t, labels)
+    def _euler_step(self, z, t, t_next, ref_img):
+        v_pred = self._forward_sample(z, t, ref_img)
         z_next = z + (t_next - t) * v_pred
         return z_next
 
     @torch.no_grad()
-    def _heun_step(self, z, t, t_next, labels):
-        v_pred_t = self._forward_sample(z, t, labels)
-
+    def _heun_step(self, z, t, t_next, ref_img):
+        v_pred_t = self._forward_sample(z, t, ref_img)
         z_next_euler = z + (t_next - t) * v_pred_t
-        v_pred_t_next = self._forward_sample(z_next_euler, t_next, labels)
-
+        v_pred_t_next = self._forward_sample(z_next_euler, t_next, ref_img)
         v_pred = 0.5 * (v_pred_t + v_pred_t_next)
         z_next = z + (t_next - t) * v_pred
         return z_next
-
+    
+    # update_ema remains same
     @torch.no_grad()
     def update_ema(self):
         source_params = list(self.parameters())

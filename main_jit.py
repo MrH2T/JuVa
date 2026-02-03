@@ -4,6 +4,7 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+from dataset import MazeDataset
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -21,12 +22,14 @@ from denoiser import Denoiser
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('JiT', add_help=False)
+    parser = argparse.ArgumentParser('JiT I2V', add_help=False)
 
     # architecture
     parser.add_argument('--model', default='JiT-B/16', type=str, metavar='MODEL',
                         help='Name of the model to train')
-    parser.add_argument('--img_size', default=256, type=int, help='Image size')
+    parser.add_argument('--img_size', default=128, type=int, help='Image/Video Spatial Resolution')
+    parser.add_argument('--num_frames', default=16, type=int, help='Number of video frames')
+    
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
@@ -34,8 +37,8 @@ def get_args_parser():
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='Epochs to warm up LR')
-    parser.add_argument('--batch_size', default=128, type=int,
-                        help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
+    parser.add_argument('--batch_size', default=8, type=int, # Lower batch size for Video (VRAM heavy)
+                        help='Batch size per GPU')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='Learning rate (absolute)')
     parser.add_argument('--blr', type=float, default=5e-5, metavar='LR',
@@ -47,7 +50,7 @@ def get_args_parser():
     parser.add_argument('--weight_decay', type=float, default=0.0,
                         help='Weight decay (default: 0.0)')
     parser.add_argument('--ema_decay1', type=float, default=0.9999,
-                        help='The first ema to track. Use the first ema for sampling by default.')
+                        help='The first ema to track.')
     parser.add_argument('--ema_decay2', type=float, default=0.9996,
                         help='The second ema to track')
     parser.add_argument('--P_mean', default=-0.8, type=float)
@@ -70,29 +73,29 @@ def get_args_parser():
                         help='ODE samping method')
     parser.add_argument('--num_sampling_steps', default=50, type=int,
                         help='Sampling steps')
-    parser.add_argument('--cfg', default=1.0, type=float,
+    parser.add_argument('--cfg', default=4.0, type=float, # Higher CFG often needed for I2V
                         help='Classifier-free guidance factor')
     parser.add_argument('--interval_min', default=0.0, type=float,
                         help='CFG interval min')
     parser.add_argument('--interval_max', default=1.0, type=float,
                         help='CFG interval max')
     parser.add_argument('--num_images', default=50000, type=int,
-                        help='Number of images to generate')
-    parser.add_argument('--eval_freq', type=int, default=40,
+                        help='Number of images to generate (Not used in current demo eval)')
+    parser.add_argument('--eval_freq', type=int, default=10,
                         help='Frequency (in epochs) for evaluation')
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate_gen', action='store_true')
-    parser.add_argument('--gen_bsz', type=int, default=256,
+    parser.add_argument('--gen_bsz', type=int, default=8,
                         help='Generation batch size')
 
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
+    # parser.add_argument('--class_num', default=1000, type=int)
 
     # checkpointing
-    parser.add_argument('--output_dir', default='./output_dir',
-                        help='Directory to save outputs (empty for no saving)')
+    parser.add_argument('--output_dir', default='./output_dir_i2v',
+                        help='Directory to save outputs')
     parser.add_argument('--resume', default='',
                         help='Folder that contains checkpoint to resume from')
     parser.add_argument('--save_last_freq', type=int, default=5,
@@ -136,20 +139,44 @@ def main(args):
     else:
         log_writer = None
 
-    # Data augmentation transforms
+    # -------------------------------------------------------------------------
+    # DATA LOADING - PSEUDO VIDEO ADAPTATION
+    # -------------------------------------------------------------------------
+    # Note: For real video training, replace this with a proper VideoDataset
+    # that returns (C, T, H, W).
+    # Here we simulate video by repeating an image T times.
+    
+    def to_video_tensor(img):
+        # img: (C, H, W) -> (C, T, H, W)
+        return img.unsqueeze(1).repeat(1, args.num_frames, 1, 1)
+
     transform_train = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
         transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()
+        transforms.PILToTensor(),
+        transforms.Lambda(to_video_tensor) # Pseudo-Video Wrapper
     ])
 
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    dataset_train = MazeDataset(args.data_path, img_size=args.img_size, num_frames=args.num_frames)
+    
+    # Validation dataset for generating demo videos
+    # Use 'val' folder if exists, otherwise reuse train or a subset
+    val_path = os.path.join(args.data_path, 'val')
+    if not os.path.exists(val_path):
+        val_path = os.path.join(args.data_path, 'train') # Fallback
+        
+    dataset_val = MazeDataset(args.data_path, img_size=args.img_size, num_frames=args.num_frames)
+    
+    print(f"Dataset train size: {len(dataset_train)}")
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
     )
-    print("Sampler_train =", sampler_train)
+    
+    # Val sampler (no shuffle for consistency)
+    sampler_val = torch.utils.data.DistributedSampler(
+        dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
+    )
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -157,6 +184,14 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True
+    )
+    
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=args.gen_bsz,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
     )
 
     torch._dynamo.config.cache_size_limit = 128
@@ -187,27 +222,48 @@ def main(args):
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
 
-    # Resume from checkpoint if provided
-    checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
+   # --- 修复后的 EMA 初始化与断点恢复逻辑 ---
+    
+    # 1. 自动构建 checkpoint 路径
+    if args.resume:
+        # 如果 args.resume 是文件夹，则找 checkpoint-last.pth
+        if os.path.isdir(args.resume):
+            checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth")
+        else:
+            checkpoint_path = args.resume
+    else:
+        checkpoint_path = None
+
+    # 2. 尝试加载 Checkpoint
     if checkpoint_path and os.path.exists(checkpoint_path):
+        print("Loading checkpoint from", checkpoint_path)
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'])
-
-        ema_state_dict1 = checkpoint['model_ema1']
-        ema_state_dict2 = checkpoint['model_ema2']
-        model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        print("Resumed checkpoint from", args.resume)
-
+        
+        # 恢复优化器和 Epoch
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
-            print("Loaded optimizer & scaler state!")
-        del checkpoint
+            if 'args' in checkpoint:
+                args.model = checkpoint['args'].model
+
+        # 恢复 EMA 参数
+        if 'model_ema1' in checkpoint:
+            ema_state_dict1 = checkpoint['model_ema1']
+            model_without_ddp.ema_params1 = [ema_state_dict1[name].to(device) for name, _ in model_without_ddp.named_parameters()]
+        
+        if 'model_ema2' in checkpoint:
+            ema_state_dict2 = checkpoint['model_ema2']
+            model_without_ddp.ema_params2 = [ema_state_dict2[name].to(device) for name, _ in model_without_ddp.named_parameters()]
+            
+        print("Resumed checkpoint successfully!")
+
+    # 3. 如果没加载到 Checkpoint (或文件不存在)，则初始化 EMA
     else:
+        print("No checkpoint found at '{}'. Training from scratch.".format(checkpoint_path))
+        # 必须确保 ema_params 被初始化为当前模型参数的副本
         model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
         model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
-        print("Training from scratch")
 
     # Evaluate generation
     if args.evaluate_gen:
@@ -215,7 +271,7 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, data_loader_val, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
         return
 
     # Training loop
@@ -249,7 +305,7 @@ def main(args):
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, data_loader_val, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
