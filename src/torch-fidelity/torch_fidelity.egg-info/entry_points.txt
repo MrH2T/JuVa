@@ -1,0 +1,2 @@
+[console_scripts]
+fidelity = torch_fidelity.fidelity:main

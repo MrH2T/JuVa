@@ -1,0 +1,45 @@
+Metadata-Version: 2.4
+Name: torch_fidelity
+Version: 0.4.0b0
+Summary: High-fidelity performance metrics for generative models in PyTorch
+Home-page: https://www.github.com/toshas/torch-fidelity
+Author: Anton Obukhov
+License: Apache License 2.0
+Keywords: reproducibility,fidelity,deep,generative,adversarial,networks,gan,inception,score,frechet,distance,kernel,perceptual,path,length,isc,fid,kid,lpips,ppl,prc,precision,recall
+Requires-Python: >=3.6
+Description-Content-Type: text/plain
+License-File: LICENSE.md
+Requires-Dist: numpy
+Requires-Dist: pillow
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: tqdm
+Dynamic: author
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+
+Evaluation of generative models such as GANs is an important part of the deep learning research. 
+In the domain of 2D image generation, three approaches became widely spread: Inception Score 
+(aka IS), Fréchet Inception Distance (aka FID), and Kernel Inception Distance (aka KID).
+
+These metrics, despite having a clear mathematical and algorithmic description, were initially 
+implemented in TensorFlow, and inherited a few properties of the framework itself and the code 
+they relied upon. These design decisions were effectively baked into the evaluation protocol and 
+became an inherent part of the metrics specification. As a result, researchers wishing to 
+compare against state of the art in generative modeling are forced to perform evaluation using 
+codebases of the original metric authors. Reimplementations of metrics in PyTorch and other 
+frameworks exist, but they do not provide a proper level of fidelity, thus making them 
+unsuitable for reporting results and comparing to other methods.   
+
+This software aims to provide epsilon-exact implementations of the said metrics in PyTorch, and thus 
+remove inconveniences associated with generative models evaluation and development. 
+Find more details and the most up-to-date information on the project webpage:
+https://www.github.com/toshas/torch-fidelity
