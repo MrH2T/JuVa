@@ -4,8 +4,8 @@ main_jit.py \
 --proj_dropout 0.0 \
 --P_mean -0.8 --P_std 0.8 \
 --img_size 128 --noise_scale 1.0 \
---batch_size 8 --blr 1e-5 \
---epochs 4000 --warmup_epochs 5 \
+--batch_size 8 --blr 5ye-5 \
+--epochs 8000 --warmup_epochs 5 \
 --gen_bsz 8 \
 --num_sampling_steps 50 \
 --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \

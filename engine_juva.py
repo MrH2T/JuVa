@@ -165,7 +165,13 @@ def evaluate(model_without_ddp, data_loader, args, epoch, batch_size=None, log_w
             ref = ref * 2.0 - 1.0
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                sampled_videos = model_without_ddp.generate(ref)
+                sampled_videos = generate_autoregressive(
+                    model_without_ddp,
+                    ref,
+                    total_frames=4*args.num_frames,  # 4x for longer videos
+                    window_size=args.num_frames,
+                    stabilization_noise=0.05
+                )
 
             # torch.distributed.barrier()
 
@@ -201,3 +207,90 @@ def evaluate(model_without_ddp, data_loader, args, epoch, batch_size=None, log_w
 
     print("Switch back from ema")
     model_without_ddp.load_state_dict(model_state_dict)
+    
+# In engine_jit.py
+
+def generate_autoregressive(model, ref_img, total_frames=64, window_size=16, stabilization_noise=0.05):
+    """
+    Performs long-horizon generation using a sliding window.
+    
+    Args:
+        model: The Denoiser/JiT model.
+        ref_img: The initial conditioning frame (B, C, H, W).
+        total_frames: Total number of frames to generate (e.g., 64).
+        window_size: The context size the model was trained on (e.g., 16).
+        stabilization_noise: Small noise level added to past frames to prevent divergence 
+                             (The "Stabilization" trick from Section 3.3).
+    """
+    device = ref_img.device
+    B, C, H, W = ref_img.shape
+    
+    # 1. Initialize the sequence with the reference frame
+    # We will append generated frames to this list
+    generated_frames = [ref_img.unsqueeze(2)] # List of (B, C, 1, H, W)
+    
+    print(f"Starting autoregressive rollout for {total_frames} frames...")
+    
+    # 2. Autoregressive Loop
+    for i in range(1, total_frames):
+        # --- A. Construct Sliding Window Context ---
+        # We need a context of length `window_size`. 
+        # If we have fewer frames than window_size, we pad with zeros/noise.
+        # If we have more, we take the most recent ones (sliding window).
+        
+        current_len = len(generated_frames)
+        start_idx = max(0, current_len - (window_size - 1))
+        
+        # Stack currently available frames: (B, C, T_avail, H, W)
+        context_list = generated_frames[start_idx:]
+        context_stack = torch.cat(context_list, dim=2) 
+        
+        # --- B. Apply Stabilization (Noise Injection) ---
+        # The paper suggests adding small noise to past frames so the model 
+        # effectively sees "slightly noisy" context, improving stability.
+        if stabilization_noise > 0:
+            noise = torch.randn_like(context_stack) * stabilization_noise
+            context_stack = context_stack + noise
+            
+        # --- C. Prepare Input for Model ---
+        # Pad with pure noise for the "Future" frame we want to predict.
+        # We currently have `T_avail` frames. We need `window_size` frames.
+        # The last frame in the window is the one we want to generate.
+        
+        needed_padding = window_size - context_stack.shape[2]
+        if needed_padding > 0:
+            # This happens at the very beginning (if training allowed variable length)
+            # For fixed-length models, we usually usually just repeat or pad zeros.
+            # Here we assume we just generate the NEXT token.
+            pad = torch.randn(B, C, needed_padding, H, W, device=device)
+            model_input = torch.cat([context_stack, pad], dim=2)
+        else:
+            # Standard case: We have full context, we append 1 noise frame for the target
+            # Note: The model input size must match window_size (16).
+            # So we take last 15 from context + 1 New Noise Frame.
+            
+            context_part = context_stack[:, :, -(window_size-1):, :, :]
+            target_noise = torch.randn(B, C, 1, H, W, device=device)
+            model_input = torch.cat([context_part, target_noise], dim=2)
+
+        # --- D. Run Diffusion Forcing Sampling ---
+        # We call the model to denoise *only the last frame* of the window.
+        # We assume model.generate_next_token() handles the specific sampling schedule
+        # (keeping past fixed, denoising future).
+        
+        with torch.no_grad():
+            # This function needs to be added to Denoiser (see Step 3 below)
+            # It returns the fully denoised sequence (B, C, Window, H, W)
+            denoised_window = model.generate_next_token(model_input)
+            
+        # --- E. Extract and Append the New Frame ---
+        # The last frame of the output is our new prediction
+        new_frame = denoised_window[:, :, -1:, :, :] # (B, C, 1, H, W)
+        generated_frames.append(new_frame)
+        
+        if i % 10 == 0:
+            print(f"Generated frame {i}/{total_frames}")
+
+    # Concatenate all frames into a video tensor
+    full_video = torch.cat(generated_frames, dim=2) # (B, C, Total, H, W)
+    return full_video

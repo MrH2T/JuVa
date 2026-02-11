@@ -41,6 +41,7 @@ A suitable [conda](https://conda.io/) environment named `jit` can be created and
 ```
 conda env create -f environment.yaml
 conda activate jit
+
 ```
 
 If you get ```undefined symbol: iJIT_NotifyEvent``` when importing ```torch```, simply
